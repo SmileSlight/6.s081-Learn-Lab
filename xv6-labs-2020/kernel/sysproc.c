@@ -42,30 +42,13 @@ uint64
 sys_sbrk(void)
 {
   int addr;
-  int n, j;
-  struct proc *p = myproc();
-  pte_t *pte, *kernelPte;
+  int n;
 
   if(argint(0, &n) < 0)
     return -1;
-  addr = p->sz;
-  if (addr + n >= PLIC){
-    return -1;
-  }
+  addr = myproc()->sz;
   if(growproc(n) < 0)
     return -1;
-  if (n > 0){
-    //将进程页表的mapping，复制一份到进程内核页表
-    for (j = addr; j < addr + n; j += PGSIZE){
-      pte = walk(p->pagetable, j, 0);
-      kernelPte = walk(p->kernelPageTable, j, 1);
-      *kernelPte = (*pte) & ~PTE_U;
-    }
-  }else {
-    for (j = addr - PGSIZE; j >= addr + n; j -= PGSIZE){
-      uvmunmap(p->kernelPageTable, j, 1, 0);
-	}
-  }
   return addr;
 }
 
@@ -87,6 +70,7 @@ sys_sleep(void)
     sleep(&ticks, &tickslock);
   }
   release(&tickslock);
+  backtrace();
   return 0;
 }
 

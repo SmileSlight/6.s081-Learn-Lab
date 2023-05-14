@@ -6,38 +6,6 @@
 #include "memlayout.h"
 #include "spinlock.h"
 #include "proc.h"
-#include "sysinfo.h"
-
-// Lab2:syscall(1)
-uint64
-sys_trace(void)
-{
-  int mask;
-  if(argint(0, &mask) < 0)
-    return -1;
-  myproc()->syscall_trace = mask;
-  return 0;
-}
-
-// Lab2:syscall(2)
-uint64
-sys_sysinfo(void)
-{
-  // 从用户态读入一个指针，作为存放 sysinfo 结构的缓冲区
-  uint64 addr;
-  if(argaddr(0, &addr) < 0)
-    return -1;
-  
-  struct sysinfo sinfo;
-  sinfo.freemem = count_free_mem(); // kalloc.c
-  sinfo.nproc = count_process(); // proc.c
-  
-  // 使用 copyout，结合当前进程的页表，获得进程传进来的指针（逻辑地址）对应的物理地址
-  // 然后将 &sinfo 中的数据复制到该指针所指位置，供用户进程使用。
-  if(copyout(myproc()->pagetable, addr, (char *)&sinfo, sizeof(sinfo)) < 0)
-    return -1;
-  return 0;
-}
 
 uint64
 sys_exit(void)
@@ -74,13 +42,30 @@ uint64
 sys_sbrk(void)
 {
   int addr;
-  int n;
+  int n, j;
+  struct proc *p = myproc();
+  pte_t *pte, *kernelPte;
 
   if(argint(0, &n) < 0)
     return -1;
-  addr = myproc()->sz;
+  addr = p->sz;
+  if (addr + n >= PLIC){
+    return -1;
+  }
   if(growproc(n) < 0)
     return -1;
+  if (n > 0){
+    //将进程页表的mapping，复制一份到进程内核页表
+    for (j = addr; j < addr + n; j += PGSIZE){
+      pte = walk(p->pagetable, j, 0);
+      kernelPte = walk(p->kernelPageTable, j, 1);
+      *kernelPte = (*pte) & ~PTE_U;
+    }
+  }else {
+    for (j = addr - PGSIZE; j >= addr + n; j -= PGSIZE){
+      uvmunmap(p->kernelPageTable, j, 1, 0);
+	}
+  }
   return addr;
 }
 

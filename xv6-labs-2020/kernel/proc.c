@@ -6,6 +6,10 @@
 #include "proc.h"
 #include "defs.h"
 
+extern char etext[];  // kernel.ld sets this to end of kernel code.
+
+extern char trampoline[]; // trampoline.S
+
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -34,14 +38,14 @@ procinit(void)
       // Allocate a page for the process's kernel stack.
       // Map it high in memory, followed by an invalid
       // guard page.
-      char *pa = kalloc();
+      /*char *pa = kalloc();
       if(pa == 0)
         panic("kalloc");
       uint64 va = KSTACK((int) (p - proc));
       kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+      p->kstack = va;*/
   }
-  kvminithart();
+  //kvminithart();
 }
 
 // Must be called with interrupts disabled,
@@ -113,6 +117,15 @@ found:
     return 0;
   }
 
+  //创建一个内核页表，并分配一个内核栈
+  p->kernelPageTable = kvmmake();
+  char *pa = kalloc();
+  if(pa == 0)
+    panic("kalloc");
+  uint64 va = TRAMPOLINE - 2*PGSIZE;
+  mappages(p->kernelPageTable, va, PGSIZE, (uint64)pa, PTE_R | PTE_W);
+  p->kstack = va;
+
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
@@ -127,8 +140,6 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
-  p->syscall_trace = 0; // (newly added) 为 syscall_trace 设置一个 0 的默认值
-
   return p;
 }
 
@@ -141,6 +152,9 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+  if(p->kernelPageTable)
+    proc_free_kernel_pagetable(p->kstack, p->kernelPageTable, p->sz);
+  p->kernelPageTable = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
@@ -187,6 +201,22 @@ proc_pagetable(struct proc *p)
   return pagetable;
 }
 
+// Free a process's kernel page table, and free the
+// physical memory it refers to.
+void
+proc_free_kernel_pagetable(uint64 kstack, pagetable_t pagetable, uint64 sz)
+{
+  uvmunmap(pagetable, UART0, 1, 0);
+  uvmunmap(pagetable, VIRTIO0, 1, 0);
+ //uvmunmap(pagetable, CLINT, 0x10000/PGSIZE, 0);
+  uvmunmap(pagetable, PLIC, 0x400000/PGSIZE, 0);
+  uvmunmap(pagetable, KERNBASE, ((uint64)etext-KERNBASE)/PGSIZE, 0);
+  uvmunmap(pagetable, (uint64)etext, (PHYSTOP-(uint64)etext)/PGSIZE, 0);
+  uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+  uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 0);
+  uvmfree2(pagetable, kstack, 1);
+}
+
 // Free a process's page table, and free the
 // physical memory it refers to.
 void
@@ -214,6 +244,7 @@ void
 userinit(void)
 {
   struct proc *p;
+  pte_t *pte, *kernelPte;
 
   p = allocproc();
   initproc = p;
@@ -222,6 +253,11 @@ userinit(void)
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
+
+  //将进程页表的mapping，复制一份到进程内核页表
+  pte = walk(p->pagetable, 0, 0);
+  kernelPte = walk(p->kernelPageTable, 0, 1);
+  *kernelPte = (*pte) & ~PTE_U;
 
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
@@ -260,9 +296,10 @@ growproc(int n)
 int
 fork(void)
 {
-  int i, pid;
+  int i, pid, j;
   struct proc *np;
   struct proc *p = myproc();
+  pte_t *pte, *kernelPte;
 
   // Allocate process.
   if((np = allocproc()) == 0){
@@ -274,6 +311,12 @@ fork(void)
     freeproc(np);
     release(&np->lock);
     return -1;
+  }
+  //将进程页表的mapping，复制一份到进程内核页表
+  for (j = 0; j < p->sz; j+=PGSIZE){
+    pte = walk(np->pagetable, j, 0);
+    kernelPte = walk(np->kernelPageTable, j, 1);
+    *kernelPte = (*pte) & ~PTE_U;
   }
   np->sz = p->sz;
 
@@ -293,8 +336,6 @@ fork(void)
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
-  np->syscall_trace = p->syscall_trace; // HERE!!! 子进程继承父进程的 syscall_trace
-  
   pid = np->pid;
 
   np->state = RUNNABLE;
@@ -477,8 +518,11 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        w_satp(MAKE_SATP(p->kernelPageTable));
+        sfence_vma();
         swtch(&c->context, &p->context);
 
+        kvminithart();
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
@@ -487,10 +531,14 @@ scheduler(void)
       }
       release(&p->lock);
     }
+#if !defined (LAB_FS)
     if(found == 0) {
       intr_on();
       asm volatile("wfi");
     }
+#else
+    ;
+#endif
   }
 }
 
@@ -696,17 +744,4 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
-}
-
-uint64
-count_process(void) { // added function for counting used process slots (lab2)
-  uint64 cnt = 0;
-  for(struct proc *p = proc; p < &proc[NPROC]; p++) {
-    // acquire(&p->lock);
-    // 不需要锁进程 proc 结构，因为我们只需要读取进程列表，不需要写
-    if(p->state != UNUSED) { // 不是 UNUSED 的进程位，就是已经分配的
-        cnt++;
-    }
-  }
-  return cnt;
 }
